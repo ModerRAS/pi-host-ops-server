@@ -114,9 +114,10 @@ enum JobCmd {
         thread: Option<String>,
         #[arg(long, value_enum, default_value_t = Delivery::Steer)]
         delivery: Delivery,
-        /// Shell-job command timeout in seconds (default 60). Pi jobs are not
-        /// wall-clock capped; they end only after ~600s without progress.
-        /// Kept for API compatibility; it never shortens a Pi wait.
+        /// Shell command timeout in seconds (default 60). Also how long a queued
+        /// job waits for an offline target before `no_agent`. Does not cap a
+        /// Pi/act run: the job succeeds when the agent goes idle, and quiet
+        /// time is not a timeout.
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -159,9 +160,10 @@ struct SteerArgs {
     prompt: Option<String>,
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
-    /// Shell-job command timeout in seconds (default 60). Pi jobs are not
-    /// wall-clock capped; they end only after ~600s without progress.
-    /// Kept for API compatibility; it never shortens a Pi wait.
+    /// Shell command timeout in seconds (default 60). Also how long a queued
+    /// job waits for an offline target before `no_agent`. Does not cap a
+    /// Pi/act run: the job succeeds when the agent goes idle, and quiet
+    /// time is not a timeout.
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long = "type", default_value = "act")]
@@ -180,9 +182,10 @@ struct JobSteerArgs {
     prompt: Option<String>,
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
-    /// Shell-job command timeout in seconds (default 60). Pi jobs are not
-    /// wall-clock capped; they end only after ~600s without progress.
-    /// Kept for API compatibility; it never shortens a Pi wait.
+    /// Shell command timeout in seconds (default 60). Also how long a queued
+    /// job waits for an offline target before `no_agent`. Does not cap a
+    /// Pi/act run: the job succeeds when the agent goes idle, and quiet
+    /// time is not a timeout.
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long = "type", default_value = "act")]

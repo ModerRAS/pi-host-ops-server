@@ -60,12 +60,20 @@ steps automatically when given a dispatcher token + host-ops URL.
 
 ## Pi idle wait
 
-After the RPC prompt is accepted, the worker waits for the session to go idle with
-one budget: an **inactivity budget** (**10 min** with no `running` state / output
-change). There is no absolute wall-clock cap — long coding runs keep their lease
-renewed and stay alive for as long as they make progress. Only 10 minutes of
-silence ends the wait, reported as a wait timeout (`timeout_kind: inactivity`),
-not a task failure. `--timeout` does not shorten a Pi wait; it applies to shell
-jobs (own command timeout, default 60s).
+After the RPC prompt is accepted, the worker waits until the session goes
+idle or the agent becomes unreachable. There is **no inactivity budget**
+and **no absolute wall-clock cap**. A long coding run that sits quiet
+(still in its agent loop, or running a command that prints nothing) stays
+running and keeps its lease renewed. When the agent finishes and goes idle,
+the job is **succeeded** — never `timed_out` for that silence.
+
+`timed_out` is only the server lease reaper: the worker died or stopped
+renewing, so it can no longer reach the agent (`lease expired`). If this
+worker sees the Pi child die or the RPC connection drop, it reports
+**failed** with `pi unreachable: ...`.
+
+`--timeout` does not shorten a Pi wait. It is the shell command timeout
+(default 60s) and the queued-job `no_agent` budget. A shell timeout bounds
+that command only; it does not turn a later idle Pi turn into `timed_out`.
 
 Never uses Cursor CloudAgent / Fast.
