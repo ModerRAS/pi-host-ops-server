@@ -97,31 +97,39 @@ curl -sS http://127.0.0.1:8787/v1/agents \
 | **`steer`** (default) | prompt with `streamingBehavior: steer` — interrupt/redirect current turn |
 | **`queue`** | idle → plain prompt; busy → prompt with `streamingBehavior: followUp` |
 
-### Pi idle wait (activity-based, no wall clock)
+### Pi idle wait (no inactivity timeout, no wall clock)
 
-After the RPC prompt is accepted, the worker waits for the Pi session to go
-idle with **one budget** (see `src/bin/worker/runtime.rs`):
+After the RPC prompt is accepted, the worker waits until the Pi session
+**finishes and goes idle**, or until it can no longer reach the agent
+(`src/bin/worker/runtime.rs`). There is no inactivity budget and no absolute
+wall-clock cap. If the child never accepts the prompt, that handshake fails
+as `pi unreachable: ...` (connection lost), not as silence.
 
-- **Inactivity budget** — **600s (10 min)** with no observable progress
-  (`running` state, or `text_tail` / `last_tool` / `settled_count` changing).
-  While the agent works, the deadline keeps refreshing, so a 6-hour coding
-  run is fine.
-
-There is **no absolute wall-clock cap** on a Pi job. `timeout_secs` stays in
-the API for shell jobs (their own command timeout, default **60s**) and for
-`no_agent` routing of queued jobs; `host-ops job create --timeout` no longer
-shortens a Pi wait. An agent that hangs with zero progress still fails after
-10 min of silence, with `timeout_kind: "inactivity"`, `wait_timeout: true`,
-and a plain message (`Pi inactivity timeout after 600s with no progress ...`).
-A send that never starts the agent fails with its own distinct message.
+- The agent finishes its turn and the session goes **idle** → the job is
+  **succeeded**. Quiet time before that — a long think, a command that
+  prints nothing, minutes with no new messages — does not end the wait and
+  is never `timed_out`.
+- **`timed_out` only** when the worker cannot keep the job reachable. The
+  server reaper marks `timed_out` with `lease expired` when the lease runs
+  out (worker dead, crashed, or no longer renewing). If the worker itself
+  sees the Pi child die or the RPC connection drop, it finishes the job as
+  **failed** with a `pi unreachable: ...` error. Silence is not one of
+  these cases. Result fields `wait_timeout` / `timeout_kind` are not an
+  inactivity timeout (`wait_timeout` is false, `timeout_kind` is null).
+- `timeout_secs` / `host-ops job create --timeout` is **not** a Pi run cap.
+  It bounds a **shell** job's command (default **60s**) and how long a
+  queued job waits for an offline target before `no_agent`. A shell command
+  timeout fails **that command** only. It does not relabel a Pi turn that
+  later goes idle as `timed_out`.
 
 ### Pi child liveness (no pi_svc)
 
 The worker owns one long-lived `pi --mode rpc` child per enabled directory
 (no `pi_svc` / control socket anywhere). Liveness is the OS process itself:
 if the child is gone, the directory shows an error in the WebUI ("pi process
-exited — restarts on next job"), the wait ends as a failure (never as fake
-idle success), and the next `act` job spawns a fresh child. Server-side
+exited — restarts on next job"), the wait ends as a failure with
+`pi unreachable: ...` (never as fake idle success, and never as an
+inactivity timeout), and the next `act` job spawns a fresh child. Server-side
 agent online/offline still follows the worker heartbeat (see § Worker
 multiplexing), so dispatch routing keeps working.
 
@@ -175,11 +183,14 @@ Claim is atomic and **matched**: `target.agent_id`, or filter (`project` / `capa
 
 Statuses: `queued` | `running` | `succeeded` | `failed` | `timed_out` | `no_agent`
 
-Nothing on the server caps how long a `running` job may take. A worker keeps
-the job alive by renewing its lease (`LEASE_SECS`, default **60s**, renewed
-every few seconds while it works). Only when the lease expires — worker dead,
-crashed, or no longer renewing — does the reaper mark the job `timed_out`
-with `lease expired`. There is no "running for 10 minutes, kill it" rule.
+Nothing on the server caps how long a `running` job may take, and there is
+no inactivity reaper. A worker keeps the job alive by renewing its lease
+(`LEASE_SECS`, default **60s**, renewed every few seconds while it works,
+including while the agent is quiet). Only when the lease expires — worker
+dead, crashed, or no longer renewing — does the reaper mark the job
+`timed_out` with `lease expired`. There is no "running for 10 minutes, kill
+it" rule and no "quiet for 10 minutes, kill it" rule. The reaper does not
+use `claimed_at` as a hard kill.
 
 ## Terminal webhook (server → your bot)
 

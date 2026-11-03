@@ -24,8 +24,10 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             // Each reaper returns transitioned terminal jobs; webhook once per job, server-side.
-            // No wall-clock job cap here: a running job lives as long as its worker
-            // keeps renewing the lease, so long coding runs survive.
+            // No wall-clock cap and no inactivity reaper: a running job lives as
+            // long as its worker keeps renewing the lease, even when Pi is quiet.
+            // `timed_out` here means the worker is gone (lease expired), not
+            // "no new messages".
             match reaper_state.db.mark_lease_expired().await {
                 Ok(jobs) => {
                     for job in jobs {

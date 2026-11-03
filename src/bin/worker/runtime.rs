@@ -22,10 +22,9 @@ use crate::config::{reject_fast, DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const DEFAULT_SHELL_TIMEOUT: u64 = 60;
-/// Give up only after this long with no observable Pi activity (10 min).
-/// There is no wall-clock cap: a long coding/`act` run never fails for being
-/// slow, only for being genuinely stuck (see `decide_wait`).
-const DEFAULT_PI_INACTIVITY_SECS: f64 = 600.0;
+/// Fallback poll while waiting for the Pi child to settle or die.
+/// There is no inactivity budget and no wall-clock cap (see `decide_wait`):
+/// a quiet but reachable agent keeps the job running.
 const POLL_STATUS_INTERVAL: f64 = 2.0;
 
 const PI_JOB_TYPES: &[&str] = &["observe", "act", "open", "clipboard", "notify"];
@@ -804,8 +803,8 @@ impl PiSession {
         }
         for reply in outbox {
             if self.write_json(&reply).await.is_err() {
-                let mut st = self.state.lock().await;
-                st.error = Some("ui_response write failed: pi stdin closed".into());
+                // Stdin is gone: the worker can no longer reach the agent.
+                self.mark_dead("pi stdin closed").await;
                 break;
             }
         }
@@ -880,7 +879,7 @@ impl PiSession {
         behavior: Option<&str>,
     ) -> Result<PromptAccept> {
         if !self.is_alive().await {
-            bail!("pi child not running");
+            bail!("pi unreachable: pi child not running");
         }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.to_string(), tx);
@@ -894,10 +893,12 @@ impl PiSession {
         }
         match timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(rec)) => Ok(PromptAccept::from_response(&rec)),
-            Ok(Err(_)) => bail!("pi child exited while waiting for prompt accept"),
+            Ok(Err(_)) => {
+                bail!("pi unreachable: pi child exited while waiting for prompt accept")
+            }
             Err(_) => {
                 self.pending.lock().await.remove(id);
-                bail!("timeout waiting for pi prompt accept");
+                bail!("pi unreachable: no prompt accept (connection lost)");
             }
         }
     }
@@ -1037,62 +1038,27 @@ job_id: {}\ntype: {}\ntimeout_secs: {:?}\npayload:\n{}\n",
     )
 }
 
-/// Observable Pi progress snapshot driving the idle-wait policy.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct PiProgress {
-    running: bool,
-    settled_count: Option<i64>,
-    last_tool: Option<String>,
-    text_tail: String,
-}
-
-impl PiProgress {
-    fn from_state(s: &PiState) -> Self {
-        Self {
-            running: s.state == "running",
-            settled_count: Some(s.settled_count),
-            last_tool: s.last_tool.clone(),
-            text_tail: s.text_tail(),
-        }
-    }
-
-    /// The agent is observably doing work (or produced new output) since prev.
-    /// `running` alone counts — a coding agent thinking without emitting
-    /// tools/text for a while is still working, not stuck.
-    fn advanced_since(&self, prev: &Self) -> bool {
-        self.running
-            || self.settled_count != prev.settled_count
-            || self.last_tool != prev.last_tool
-            || self.text_tail != prev.text_tail
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitEnd {
     Continue,
+    /// Agent finished the turn and the session is idle. Job succeeded.
     IdleDone,
+    /// Session reached error / dead / stopped.
     Terminal,
+    /// Worker is shutting down and can no longer drive the agent.
     Stopped,
-    TimeoutInactivity,
 }
 
-/// Pure idle-wait policy (fake-clock friendly: callers pass elapsed times).
-/// Terminal/idle wins over the timeout. Only silence ends a healthy wait —
-/// total elapsed time is deliberately not a parameter.
-fn decide_wait(
-    terminal: bool,
-    idle_done: bool,
-    idle_elapsed_secs: f64,
-    inactivity_secs: f64,
-) -> WaitEnd {
+/// Pure idle-wait policy. Elapsed time is not an input: silence, a long
+/// think, or a command that prints nothing does not end the wait. The wait
+/// ends when the agent goes idle after work, or when the session is terminal
+/// (dead child, connection lost, agent error).
+fn decide_wait(terminal: bool, idle_done: bool) -> WaitEnd {
     if terminal {
         return WaitEnd::Terminal;
     }
     if idle_done {
         return WaitEnd::IdleDone;
-    }
-    if idle_elapsed_secs >= inactivity_secs {
-        return WaitEnd::TimeoutInactivity;
     }
     WaitEnd::Continue
 }
@@ -1100,35 +1066,119 @@ fn decide_wait(
 struct WaitOutcome {
     status: PiState,
     end: WaitEnd,
-    saw_running: bool,
 }
 
-/// Activity-based wait for the Pi session to go idle after the prompt is
-/// accepted. One budget: inactivity, refreshed by observable progress.
-/// Progress comes from the owned
-/// child's in-memory state, and a dead child ends the wait as a failure —
-/// never as idle success. Lease renewals + progress events continue as today.
+/// How the worker reports a finished Pi wait.
+///
+/// `ok` maps to the job row: true → `succeeded`, false → `failed`.
+/// The worker never sets `timed_out`. That status is only the server lease
+/// reaper (worker gone). Idle-done is always success, even after a long
+/// quiet stretch. A dead child or lost connection is `failed` with a
+/// `pi unreachable:` error — not an inactivity timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PiWaitFinish {
+    ok: bool,
+    error: Option<String>,
+}
+
+#[cfg(test)]
+impl PiWaitFinish {
+    /// Status the server stores for this report. Never `timed_out`.
+    fn status_word(&self) -> &'static str {
+        if self.ok { "succeeded" } else { "failed" }
+    }
+}
+
+fn error_says_unreachable(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("stdin closed")
+        || e.contains("stdout closed")
+        || e.contains("pi child")
+        || e.contains("connection lost")
+        || e.contains("broken pipe")
+}
+
+fn is_unreachable(end: WaitEnd, state: &str, session_error: Option<&str>) -> bool {
+    if end == WaitEnd::Stopped {
+        return true;
+    }
+    if end != WaitEnd::Terminal {
+        return false;
+    }
+    matches!(state, "dead" | "stopped") || session_error.is_some_and(error_says_unreachable)
+}
+
+fn unreachable_message(end: WaitEnd, state: &str, session_error: Option<&str>) -> String {
+    if end == WaitEnd::Stopped {
+        return "pi unreachable: worker stopped before the agent finished (connection lost)".into();
+    }
+    let detail = session_error.filter(|s| !s.is_empty()).unwrap_or(match state {
+        "dead" => "pi child process dead",
+        "stopped" => "pi session stopped",
+        _ => "connection lost",
+    });
+    if detail.to_ascii_lowercase().contains("unreachable") {
+        return detail.to_string();
+    }
+    if state == "dead" {
+        format!("pi unreachable: {detail}; session restarts on next job")
+    } else {
+        format!("pi unreachable: {detail}")
+    }
+}
+
+/// Map a finished wait to the job report.
+///
+/// Idle-done is succeeded and does not look at any command timeout. A shell
+/// payload timeout bounds that command only; it cannot flip this result.
+fn finish_pi_wait(end: WaitEnd, state: &str, session_error: Option<&str>) -> PiWaitFinish {
+    if end == WaitEnd::IdleDone {
+        return PiWaitFinish { ok: true, error: None };
+    }
+    if is_unreachable(end, state, session_error) {
+        return PiWaitFinish {
+            ok: false,
+            error: Some(unreachable_message(end, state, session_error)),
+        };
+    }
+    if matches!(end, WaitEnd::Terminal | WaitEnd::Stopped) {
+        return PiWaitFinish {
+            ok: false,
+            error: Some(
+                session_error
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("session state={state}")),
+            ),
+        };
+    }
+    // Continue is not a finish. Callers only report after the wait returns.
+    PiWaitFinish {
+        ok: false,
+        error: Some("pi wait ended without the agent finishing".into()),
+    }
+}
+
+/// Wait until the Pi session goes idle after the prompt is accepted, or until
+/// the worker can no longer reach the agent. Quiet time does not end the
+/// wait and does not mark the job timed out. A dead child ends the wait as
+/// a failure — never as idle success. Lease renewals continue the whole
+/// time, including while the agent emits nothing.
 async fn wait_until_idle_with_events(
     api: &ApiClient,
     sess: &PiSession,
     job_id: &str,
-    inactivity_secs: f64,
     event_interval_secs: f64,
     settled_before: Option<i64>,
     stop: &AtomicBool,
 ) -> WaitOutcome {
-    let mut last_progress_at = Instant::now();
-    let mut prev = PiProgress::default();
-    let mut last = PiState { state: "starting".into(), ..Default::default() };
+    let mut last;
     let mut saw_running = false;
     let mut last_event_at = Instant::now() - Duration::from_secs(3600);
     let mut last_tail = String::new();
     let mut last_tool: Option<String> = None;
 
     loop {
-        if stop.load(Ordering::Relaxed) {
-            return WaitOutcome { status: last, end: WaitEnd::Stopped, saw_running };
-        }
         // Subscribe before snapshotting so a settle/exit landing in between
         // still wakes us: completion uploads the result at once.
         let wake = sess.changed_notified();
@@ -1144,15 +1194,10 @@ async fn wait_until_idle_with_events(
                 cur_state.error = Some(format!("pi child exited code={code:?}"));
             }
         }
-        let cur = PiProgress::from_state(&cur_state);
-        if cur.running {
+        if cur_state.state == "running" {
             saw_running = true;
         }
         let now = Instant::now();
-        if cur.advanced_since(&prev) {
-            last_progress_at = now;
-        }
-        prev = cur;
         last = cur_state;
         let tool = last.last_tool.clone();
         let text_tail = last.text_tail();
@@ -1168,24 +1213,24 @@ async fn wait_until_idle_with_events(
                 last_tail = text_tail;
             }
             api.post_event(job_id, "status", Some(&format!("state={}", last.state)), Some(json!({"state": last.state, "settled_count": last.settled_count}))).await;
+            // Renew even when the agent has gone quiet, so the lease reaper
+            // does not time out a healthy run.
             api.renew_lease(job_id).await;
             last_event_at = now;
         }
         let terminal = matches!(last.state.as_str(), "error" | "dead" | "stopped");
         let bumped = matches!(settled_before, Some(b) if last.settled_count > b);
         let idle_done = last.state == "idle" && (bumped || saw_running);
-        let end = decide_wait(
-            terminal,
-            idle_done,
-            last_progress_at.elapsed().as_secs_f64(),
-            inactivity_secs,
-        );
-        match end {
-            WaitEnd::Continue => {}
-            _ => return WaitOutcome { status: last, end, saw_running },
+        let end = decide_wait(terminal, idle_done);
+        if end != WaitEnd::Continue {
+            return WaitOutcome { status: last, end };
         }
-        // Event-driven wakeup (settle/exit/progress) with the 2s tick only
-        // as a fallback — no post-settle aliveness dance, just upload.
+        // A finished turn wins over shutdown so idle-done is still succeeded.
+        if stop.load(Ordering::Relaxed) {
+            return WaitOutcome { status: last, end: WaitEnd::Stopped };
+        }
+        // Event-driven wakeup (settle/exit) with the 2s tick only as a
+        // fallback — no post-settle aliveness dance, just upload.
         tokio::select! {
             _ = wake => {}
             _ = sleep(Duration::from_secs_f64(POLL_STATUS_INTERVAL)) => {}
@@ -1208,8 +1253,7 @@ async fn run_via_pi(
     };
     let settled_before = Some(sess.snapshot().await.settled_count);
     let prompt = build_pi_prompt(job);
-    // `timeout_secs` is NOT a Pi run cap; only silence ends this wait.
-    let inactivity_secs = DEFAULT_PI_INACTIVITY_SECS;
+    // `timeout_secs` is not a Pi run cap. It never ends this wait.
 
     let delivery = job.delivery_mode.as_deref().unwrap_or("steer").trim().to_lowercase();
     let job_id = job.id.to_string();
@@ -1233,11 +1277,20 @@ async fn run_via_pi(
         return (false, None, Some(format!("pi rejected prompt: {}", accept.error.unwrap_or_else(|| "unknown".into()))));
     }
     info!(session = %rt.pi_session, disposition = ?accept.disposition, "pi rpc prompt accepted");
-    let outcome = wait_until_idle_with_events(api, &sess, &job_id, inactivity_secs, rt.event_interval_secs, settled_before, stop).await;
+    let outcome = wait_until_idle_with_events(
+        api,
+        &sess,
+        &job_id,
+        rt.event_interval_secs,
+        settled_before,
+        stop,
+    )
+    .await;
     let st = outcome.status;
     let text_tail = st.text_tail();
-    let wait_timeout = outcome.end == WaitEnd::TimeoutInactivity;
-    let timeout_kind = wait_timeout.then_some("inactivity");
+    // No inactivity / wall-clock wait timeout. `wait_timeout` stays false so
+    // a quiet finished turn is not reported as one. Unreachable is the error.
+    let finish = finish_pi_wait(outcome.end, &st.state, st.error.as_deref());
     let result = truncate_result(json!({
         "via": "pi_rpc",
         "session": rt.pi_session,
@@ -1249,39 +1302,15 @@ async fn run_via_pi(
         "last_tool": st.last_tool,
         "text_tail": text_tail,
         "text_log_tail": tail_chars(st.text_log(), 8000),
-        "wait_timeout": wait_timeout,
-        "timeout_kind": timeout_kind,
+        "wait_timeout": false,
+        "timeout_kind": Value::Null,
     }));
-    let mut ok = true;
-    let mut err_msg = None;
-    if st.state == "dead" {
-        // The OS process is gone — never stale status. Next act respawns.
-        ok = false;
-        err_msg = Some(format!(
-            "pi child process exited{}; session restarts on next job",
-            st.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default(),
-        ));
-    } else if matches!(st.state.as_str(), "error" | "stopped") {
-        ok = false;
-        err_msg = Some(st.error.clone().unwrap_or_else(|| format!("session state={}", st.state)));
-    } else if outcome.end == WaitEnd::TimeoutInactivity {
-        ok = false;
-        err_msg = Some(if !outcome.saw_running && st.state != "idle" {
-            format!(
-                "Pi inactivity timeout after {}s: send accepted but agent never started (state={})",
-                inactivity_secs as u64,
-                st.state,
-            )
-        } else {
-            format!(
-                "Pi inactivity timeout after {}s with no progress (state={})",
-                inactivity_secs as u64, st.state,
-            )
-        });
-    }
-    (ok, Some(result), err_msg)
+    (finish.ok, Some(result), finish.error)
 }
 
+/// Run one local shell command. `timeout_secs` bounds **this command** only
+/// (default 60s). `ok == false` is a command failure — the server stores
+/// `failed`, not `timed_out` — and it does not apply to a Pi turn.
 async fn run_shell_local(rt: &DirRuntime, job: &Job) -> (bool, Option<Value>, Option<String>) {
     let command = job.payload.get("command").and_then(|v| v.as_str()).map(|s| s.to_string());
     let Some(command) = command.filter(|c| !c.trim().is_empty()) else {
@@ -1369,114 +1398,116 @@ mod tests {
         assert!(reject_fast("x", "foo-fast").is_err());
     }
 
-    fn progress(state: &str, tail: &str, tool: Option<&str>, settled: i64) -> PiProgress {
-        let mut st = PiState::default();
-        st.state = state.into();
-        st.push_text(tail);
-        st.last_tool = tool.map(|s| s.to_string());
-        st.settled_count = settled;
-        PiProgress::from_state(&st)
-    }
-
-    #[test]
-    fn progress_advances_on_running_or_changed_output() {
-        // Idle with no output change is not progress.
-        let base = progress("idle", "", None, 0);
-        assert!(!base.advanced_since(&progress("idle", "", None, 0)));
-        // Running alone counts — a thinking agent emitting nothing is working.
-        assert!(progress("running", "", None, 0).advanced_since(&base));
-        // New text / tool / settled count counts even when not running.
-        assert!(progress("idle", "ab", None, 0).advanced_since(&base));
-        assert!(progress("idle", "", Some("wiki_observe"), 0).advanced_since(&base));
-        assert!(progress("idle", "", None, 1).advanced_since(&base));
-        // Identical snapshot twice is not progress.
-        let same = progress("idle", "ab", Some("wiki_observe"), 1);
-        assert!(!same.advanced_since(&same));
-    }
-
     #[test]
     fn wait_policy_branches() {
-        let inact = 600.0;
-        // Long run, still working → keep waiting. There is no wall clock, so
-        // even an hour-long busy run continues.
-        assert_eq!(decide_wait(false, false, 5.0, inact), WaitEnd::Continue);
-        // Silence past the inactivity budget → inactivity timeout.
-        assert_eq!(decide_wait(false, false, 600.0, inact), WaitEnd::TimeoutInactivity);
-        // Idle after running → success, even right at the deadline.
-        assert_eq!(decide_wait(false, true, 600.0, inact), WaitEnd::IdleDone);
-        // Terminal state beats the timeout.
-        assert_eq!(decide_wait(true, false, 600.0, inact), WaitEnd::Terminal);
+        // Healthy and not finished → keep waiting. No clock, no silence budget.
+        assert_eq!(decide_wait(false, false), WaitEnd::Continue);
+        // Agent finished and went idle → success, whatever the quiet stretch was.
+        assert_eq!(decide_wait(false, true), WaitEnd::IdleDone);
+        // Dead / error / stopped beats a would-be idle so it is never success.
+        assert_eq!(decide_wait(true, true), WaitEnd::Terminal);
+        assert_eq!(decide_wait(true, false), WaitEnd::Terminal);
     }
 
-    /// The old 3600s absolute cap must never end an active wait: the policy has
-    /// no elapsed-time input at all, only time since the last progress.
+    /// The old absolute cap and the 600s inactivity budget are gone: the
+    /// policy has no elapsed-time input. Quiet ticks never end the wait.
     #[test]
-    fn wait_policy_has_no_absolute_cap() {
-        for idle_e in [0.0, 1.0, 599.0] {
-            assert_eq!(decide_wait(false, false, idle_e, 600.0), WaitEnd::Continue);
+    fn silence_never_ends_the_wait_or_marks_timed_out() {
+        // Well past the old 600s inactivity budget and the old wall clock.
+        for _ in 0..10_000 {
+            assert_eq!(decide_wait(false, false), WaitEnd::Continue);
         }
+        let finish = finish_pi_wait(decide_wait(false, true), "idle", None);
+        assert!(finish.ok);
+        assert!(finish.error.is_none());
+        assert_eq!(finish.status_word(), "succeeded");
+        assert_ne!(finish.status_word(), "timed_out");
     }
 
-    /// Fold a status timeline through the same progress/idle accounting the
-    /// wait loop uses (fake clock): replicates the b76169c6 repro — a slow
-    /// coding run with occasional output must not time out at old 300s.
+    /// A slow coding run that goes quiet (still in the agent loop, or running
+    /// a command with no new messages) then goes idle is succeeded.
     #[test]
-    fn wait_policy_survives_slow_coding_run() {
-        let inact = 600.0;
-        // (state, tail, tool, settled, dt_secs)
-        let timeline: Vec<(&str, &str, Option<&str>, i64, f64)> = vec![
-            ("idle", "", None, 0, 2.0), // send just dispatched
-            ("running", "step 1", None, 0, 120.0),
-            ("running", "step 1", Some("wiki_observe"), 0, 300.0),
-            ("running", "step 2: editing", Some("wiki_observe"), 0, 590.0),
-            // Long quiet stretch, still running → progress, timer refreshes.
-            ("running", "step 2: editing", Some("wiki_observe"), 0, 590.0),
-            ("idle", "done", Some("wiki_observe"), 1, 5.0),
+    fn quiet_running_then_idle_is_succeeded() {
+        // (terminal, idle_done)
+        let steps = [
+            (false, false), // prompt just accepted
+            (false, false), // running
+            (false, false), // still running, no new text for a long time
+            (false, false), // command in flight, still no new messages
+            (false, true),  // turn finished, session idle
         ];
-        let mut prev = PiProgress::default();
-        let mut saw_running = false;
-        let mut idle_e = 0.0;
-        let mut end = WaitEnd::Continue;
-        for (state, tail, tool, settled, dt) in &timeline {
-            let cur = progress(state, tail, *tool, *settled);
-            if cur.running {
-                saw_running = true;
-            }
-            if cur.advanced_since(&prev) {
-                idle_e = 0.0;
-            } else {
-                idle_e += dt;
-            }
-            prev = cur;
-            let idle_done = *state == "idle" && saw_running;
-            end = decide_wait(false, idle_done, idle_e, inact);
+        let mut finished = None;
+        for (terminal, idle_done) in steps {
+            let end = decide_wait(terminal, idle_done);
             if end != WaitEnd::Continue {
+                finished = Some(end);
                 break;
             }
         }
+        let end = finished.expect("idle must end the timeline");
         assert_eq!(end, WaitEnd::IdleDone);
+        let finish = finish_pi_wait(end, "idle", Some("stale error must not win"));
+        assert!(finish.ok, "idle-done is success even if an old error string is around");
+        assert!(finish.error.is_none());
+        assert_eq!(finish.status_word(), "succeeded");
+    }
+
+    /// A steer that never starts is not an inactivity timeout. The wait
+    /// continues until the agent finishes or becomes unreachable.
+    #[test]
+    fn quiet_agent_that_never_starts_keeps_waiting() {
+        for _ in 0..7 {
+            assert_eq!(decide_wait(false, false), WaitEnd::Continue);
+        }
     }
 
     #[test]
-    fn wait_policy_stuck_send_times_out_inactivity() {
-        // Steer accepted but the agent never starts: idle + no output.
-        let mut prev = PiProgress::default();
-        let mut idle_e = 0.0;
-        let mut end = WaitEnd::Continue;
-        for _ in 0..7 {
-            let cur = progress("idle", "", None, 0);
-            if cur.advanced_since(&prev) {
-                idle_e = 0.0;
-            } else {
-                idle_e += 100.0;
-            }
-            prev = cur;
-            end = decide_wait(false, false, idle_e, 600.0);
-            if end != WaitEnd::Continue {
-                break;
-            }
-        }
-        assert_eq!(end, WaitEnd::TimeoutInactivity);
+    fn dead_child_is_unreachable_failure_not_timed_out() {
+        let finish = finish_pi_wait(
+            WaitEnd::Terminal,
+            "dead",
+            Some("pi stdout closed (pi child gone)"),
+        );
+        assert!(!finish.ok);
+        assert_eq!(finish.status_word(), "failed");
+        let err = finish.error.expect("error");
+        assert!(err.contains("pi unreachable"), "{err}");
+        assert!(err.contains("stdout closed"), "{err}");
+        assert!(!err.to_lowercase().contains("inactivity"), "{err}");
+    }
+
+    #[test]
+    fn lost_connection_and_stopped_worker_are_unreachable() {
+        let stdin = finish_pi_wait(WaitEnd::Terminal, "error", Some("pi stdin closed"));
+        let err = stdin.error.expect("stdin");
+        assert!(err.contains("pi unreachable"), "{err}");
+        assert!(err.contains("stdin closed"), "{err}");
+
+        let stopped = finish_pi_wait(WaitEnd::Stopped, "running", None);
+        assert!(!stopped.ok);
+        assert_eq!(stopped.status_word(), "failed");
+        let err = stopped.error.expect("stopped");
+        assert!(err.contains("pi unreachable"), "{err}");
+        assert!(err.contains("connection lost"), "{err}");
+    }
+
+    /// An agent-reported error is a task failure, not "worker cannot reach agent".
+    #[test]
+    fn agent_error_is_failure_not_unreachable_timeout() {
+        let finish = finish_pi_wait(WaitEnd::Terminal, "error", Some("boom"));
+        assert!(!finish.ok);
+        assert_eq!(finish.error.as_deref(), Some("boom"));
+        assert_eq!(finish.status_word(), "failed");
+    }
+
+    /// A shell payload timeout may bound that command. It is not an input to
+    /// the Pi wait, so it cannot relabel idle-done as timed_out.
+    #[test]
+    fn command_timeout_does_not_redefine_idle_done() {
+        let finish = finish_pi_wait(WaitEnd::IdleDone, "idle", None);
+        assert!(finish.ok);
+        assert!(finish.error.is_none());
+        assert_eq!(finish.status_word(), "succeeded");
     }
 
     fn record(t: &str) -> Value {
@@ -1657,17 +1688,182 @@ time.sleep(60)
         let stop = AtomicBool::new(false);
         let t0 = std::time::Instant::now();
         let outcome = wait_until_idle_with_events(
-            &api, &sess, "job-test", 10.0, 0.01, settled_before, &stop,
+            &api, &sess, "job-test", 0.01, settled_before, &stop,
         )
         .await;
         let accept2 = p2.await.unwrap().expect("p2 accept");
         assert!(accept2.success);
         assert_eq!(outcome.end, WaitEnd::IdleDone);
-        assert!(outcome.saw_running);
+        assert_eq!(outcome.status.state, "idle");
+        let finish = finish_pi_wait(outcome.end, &outcome.status.state, outcome.status.error.as_deref());
+        assert!(finish.ok);
+        assert_eq!(finish.status_word(), "succeeded");
         assert!(t0.elapsed() < Duration::from_secs(8), "settle must upload promptly");
 
         sessions.shutdown_all().await;
         assert!(!sess.is_alive().await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn write_executable(dir: &std::path::Path, body: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let stub = dir.join("fake-pi");
+        std::fs::write(&stub, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    #[cfg(unix)]
+    fn stub_runtime(dir: &std::path::Path, pi_bin: PathBuf, event_interval_secs: f64) -> DirRuntime {
+        DirRuntime {
+            host_ops_url: "http://127.0.0.1:9".into(),
+            agent_token: "t".into(),
+            agent_id: "a".into(),
+            work_dir: dir.to_path_buf(),
+            pi_bin: Some(pi_bin),
+            pi_session: format!("test-{}", Uuid::new_v4()),
+            provider: "opencode-go".into(),
+            model: "muse-spark-1.3-contributor".into(),
+            event_interval_secs,
+        }
+    }
+
+    /// A child that accepts the prompt and then exits is unreachable, promptly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_dead_child_is_unreachable() {
+        let dir = std::env::temp_dir().join(format!("host-ops-rpc-dead-{}", Uuid::new_v4()));
+        let stub = write_executable(
+            &dir,
+            r#"#!/usr/bin/env python3
+import sys, json
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+line = sys.stdin.readline()
+if not line:
+    sys.exit(0)
+try:
+    rid = json.loads(line).get("id", "p0")
+except Exception:
+    rid = "p0"
+emit({"id": rid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
+emit({"type": "agent_start"})
+sys.exit(1)
+"#,
+        );
+        let sessions = PiSessions::default();
+        let rt = stub_runtime(&dir, stub, 30.0);
+        let sess = sessions.ensure(&rt).await.expect("spawn stub pi");
+        let settled_before = Some(sess.snapshot().await.settled_count);
+        let accept = sess.send_prompt("p1", "hello", Some("steer")).await.expect("accept");
+        assert!(accept.success);
+        let api = ApiClient::new("http://127.0.0.1:9", "t", "a").unwrap();
+        let stop = AtomicBool::new(false);
+        let t0 = std::time::Instant::now();
+        let outcome = wait_until_idle_with_events(
+            &api, &sess, "job-dead", 30.0, settled_before, &stop,
+        )
+        .await;
+        assert!(t0.elapsed() < Duration::from_secs(8), "dead child must end the wait promptly");
+        assert_eq!(outcome.end, WaitEnd::Terminal);
+        assert_eq!(outcome.status.state, "dead");
+        let finish = finish_pi_wait(outcome.end, &outcome.status.state, outcome.status.error.as_deref());
+        assert!(!finish.ok);
+        assert_eq!(finish.status_word(), "failed");
+        let err = finish.error.expect("unreachable error");
+        assert!(err.contains("pi unreachable"), "{err}");
+        assert!(!err.to_lowercase().contains("inactivity"), "{err}");
+        sessions.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An alive child that has started and then goes silent must keep the
+    /// wait open. No new messages is not a timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_quiet_alive_child_keeps_waiting() {
+        let dir = std::env::temp_dir().join(format!("host-ops-rpc-quiet-{}", Uuid::new_v4()));
+        let stub = write_executable(
+            &dir,
+            r#"#!/usr/bin/env python3
+import sys, json
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+line = sys.stdin.readline()
+if not line:
+    sys.exit(0)
+try:
+    rid = json.loads(line).get("id", "p0")
+except Exception:
+    rid = "p0"
+emit({"id": rid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
+emit({"type": "agent_start"})
+# Stay quiet until stdin closes. Do not settle.
+while True:
+    extra = sys.stdin.readline()
+    if not extra:
+        sys.exit(0)
+"#,
+        );
+        let sessions = PiSessions::default();
+        let rt = stub_runtime(&dir, stub, 30.0);
+        let sess = sessions.ensure(&rt).await.expect("spawn stub pi");
+        let settled_before = Some(sess.snapshot().await.settled_count);
+        let accept = sess.send_prompt("p1", "hello", Some("steer")).await.expect("accept");
+        assert!(accept.success);
+        assert!(sess.is_alive().await);
+        let api = ApiClient::new("http://127.0.0.1:9", "t", "a").unwrap();
+        let stop = AtomicBool::new(false);
+        let stalled = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_until_idle_with_events(&api, &sess, "job-quiet", 30.0, settled_before, &stop),
+        )
+        .await;
+        assert!(stalled.is_err(), "quiet but alive agent must not end the wait");
+        assert!(sess.is_alive().await);
+        sessions.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shell `timeout_secs` bounds that command. Success stays success; the
+    /// command timeout is a failure of the command, not a Pi idle timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_command_timeout_does_not_redefine_idle_done() {
+        let dir = std::env::temp_dir().join(format!("host-ops-shell-to-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = stub_runtime(&dir, dir.join("unused"), 30.0);
+        let slow = Job {
+            id: Uuid::new_v4(),
+            job_type: "shell".into(),
+            payload: json!({"command": "sleep 30"}),
+            timeout_secs: Some(1),
+            delivery_mode: None,
+        };
+        let (ok, result, err) = run_shell_local(&rt, &slow).await;
+        assert!(!ok);
+        let err = err.expect("shell timeout error");
+        assert!(err.contains("shell timed out after 1"), "{err}");
+        assert!(!err.to_lowercase().contains("inactivity"), "{err}");
+        assert_eq!(result.expect("result").get("timeout"), Some(&json!(true)));
+        // The same budget must not flip a finished Pi turn.
+        let done = finish_pi_wait(WaitEnd::IdleDone, "idle", None);
+        assert!(done.ok);
+        assert_eq!(done.status_word(), "succeeded");
+
+        let fast = Job {
+            id: Uuid::new_v4(),
+            job_type: "shell".into(),
+            payload: json!({"command": "true"}),
+            timeout_secs: Some(5),
+            delivery_mode: None,
+        };
+        let (ok, _, err) = run_shell_local(&rt, &fast).await;
+        assert!(ok, "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

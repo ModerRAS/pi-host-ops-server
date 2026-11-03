@@ -931,8 +931,12 @@ impl Db {
     // ── Reapers ─────────────────────────────────────────────────────────
 
     /// Mark lease-expired running jobs; returns transitioned jobs for webhooks.
-    /// This is the only recovery path for a claimed job whose worker died —
-    /// there is no fixed claimed_at age cap, so long jobs are never killed.
+    /// This is the only server path to `timed_out`: the worker stopped renewing
+    /// (dead, crashed, or unreachable). There is no `claimed_at` age cap and
+    /// no inactivity reaper, so a quiet but heartbeating job is never killed.
+    /// Worker-submitted results are `succeeded` or `failed` only — a dead Pi
+    /// child is reported by the worker as `failed` with an unreachable error,
+    /// not rewritten here.
     pub async fn mark_lease_expired(&self) -> Result<Vec<Job>> {
         let now = Utc::now().to_rfc3339();
         let ids: Vec<String> = sqlx::query_scalar(
