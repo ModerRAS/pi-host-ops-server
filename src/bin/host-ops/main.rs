@@ -114,9 +114,9 @@ enum JobCmd {
         thread: Option<String>,
         #[arg(long, value_enum, default_value_t = Delivery::Steer)]
         delivery: Delivery,
-        /// Shell-job command timeout in seconds (default 60). Pi jobs are not
-        /// wall-clock capped; they end only after ~600s without progress.
-        /// Kept for API compatibility; it never shortens a Pi wait.
+        /// Command timeout in seconds for `shell` jobs (default 60). Bounds
+        /// that command only: a Pi job has no wall-clock or inactivity kill,
+        /// it succeeds when the agent goes idle after its last message.
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -159,9 +159,9 @@ struct SteerArgs {
     prompt: Option<String>,
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
-    /// Shell-job command timeout in seconds (default 60). Pi jobs are not
-    /// wall-clock capped; they end only after ~600s without progress.
-    /// Kept for API compatibility; it never shortens a Pi wait.
+    /// Command timeout in seconds for `shell` jobs (default 60). Bounds
+    /// that command only: a Pi job has no wall-clock or inactivity kill,
+    /// it succeeds when the agent goes idle after its last message.
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long = "type", default_value = "act")]
@@ -180,9 +180,9 @@ struct JobSteerArgs {
     prompt: Option<String>,
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
-    /// Shell-job command timeout in seconds (default 60). Pi jobs are not
-    /// wall-clock capped; they end only after ~600s without progress.
-    /// Kept for API compatibility; it never shortens a Pi wait.
+    /// Command timeout in seconds for `shell` jobs (default 60). Bounds
+    /// that command only: a Pi job has no wall-clock or inactivity kill,
+    /// it succeeds when the agent goes idle after its last message.
     #[arg(long)]
     timeout: Option<u64>,
     #[arg(long = "type", default_value = "act")]
